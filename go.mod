@@ -7,6 +7,7 @@ require (
 	github.com/cloudwego/hertz v0.2.1
 	github.com/coreos/etcd v3.3.27+incompatible
 	github.com/gookit/color v1.5.1
+	github.com/panjf2000/ants v1.2.1
 	github.com/rocket049/gocui v0.3.2
 	github.com/spf13/cobra v1.5.0
 	github.com/spf13/viper v1.12.0
