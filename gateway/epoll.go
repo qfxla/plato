@@ -2,8 +2,6 @@ package gateway
 
 import (
 	"fmt"
-	"github.com/hardcore-os/plato/common/config"
-	"golang.org/x/sys/unix"
 	"log"
 	"net"
 	"reflect"
@@ -11,8 +9,12 @@ import (
 	"sync"
 	"sync/atomic"
 	"syscall"
+
+	"github.com/hardcore-os/plato/common/config"
+	"golang.org/x/sys/unix"
 )
 
+// 全局对象
 var ep *ePool    // epoll池
 var tcpNum int32 // 当前服务允许接入的最大tcp连接数
 
@@ -44,7 +46,7 @@ func newEPool(ln *net.TCPListener, cb func(c *connection, ep *epoller)) *ePool {
 	}
 }
 
-// 创建一个专门处理accept事件的协程，与当前cpu的核数对应，能够发挥最大功效
+// 创建一个专门处理 accept 事件的协程，与当前cpu的核数对应，能够发挥最大功效
 func (e *ePool) createAcceptProcess() {
 	for i := 0; i < runtime.NumCPU(); i++ {
 		go func() {
@@ -55,19 +57,16 @@ func (e *ePool) createAcceptProcess() {
 					_ = conn.Close()
 					continue
 				}
-				setTcpConfig(conn)
+				setTcpConifg(conn)
 				if e != nil {
-					if ne, ok := e.(net.Error); ok & ne.Temporary() {
+					if ne, ok := e.(net.Error); ok && ne.Temporary() {
 						fmt.Errorf("accept temp err: %v", ne)
 						continue
 					}
 					fmt.Errorf("accept err: %v", e)
 				}
-				c := connection{
-					conn: conn,
-					fd:   socketFD(conn),
-				}
-				ep.addTask(&c)
+				c := NewConnection(conn)
+				ep.addTask(c)
 			}
 		}()
 	}
@@ -79,7 +78,7 @@ func (e *ePool) startEPool() {
 	}
 }
 
-// 开启多个epoll去处理epollPoll中eChan的连接
+// 轮询器池 处理器
 func (e *ePool) startEProc() {
 	ep, err := newEpoller()
 	if err != nil {
@@ -94,20 +93,18 @@ func (e *ePool) startEProc() {
 			case conn := <-e.eChan:
 				addTcpNum()
 				fmt.Printf("tcpNum:%d\n", tcpNum)
-				// 将conn添加至epoll实例的中（实际上是关联epoll中的fd，然后用过epoll池中的map关联起来），
 				if err := ep.add(conn); err != nil {
 					fmt.Printf("failed to add connection %v\n", err)
-					conn.Close()
+					conn.Close() //登录未成功直接关闭连接
 					continue
 				}
 				fmt.Printf("EpollerPool new connection[%v] tcpSize:%d\n", conn.RemoteAddr(), tcpNum)
 			}
 		}
 	}()
-	// 轮询器在这里轮询等待，当有wait发生时则调用回调函数去处理
+	// 轮询器在这里轮询等待, 当有wait发生时则调用回调函数去处理
 	for {
 		select {
-		// 这种写法是监听epoll池的退出指令
 		case <-e.done:
 			return
 		default:
@@ -120,7 +117,6 @@ func (e *ePool) startEProc() {
 				if conn == nil {
 					break
 				}
-				// 由各个epoll实例去处理发生的conn，处理过程用我们传进来的func
 				e.f(conn, ep)
 			}
 		}
@@ -133,7 +129,8 @@ func (e *ePool) addTask(c *connection) {
 
 // epoller 对象 轮询器
 type epoller struct {
-	fd int
+	fd            int
+	fdToConnTable sync.Map
 }
 
 func newEpoller() (*epoller, error) {
@@ -146,7 +143,7 @@ func newEpoller() (*epoller, error) {
 	}, nil
 }
 
-// TODO: 默认水平触发模式，可采用非阻塞FD，优化边沿触发模式
+// TODO: 默认水平触发模式,可采用非阻塞FD,优化边沿触发模式
 func (e *epoller) add(conn *connection) error {
 	// Extract file descriptor associated with the connection
 	fd := conn.fd
@@ -154,10 +151,11 @@ func (e *epoller) add(conn *connection) error {
 	if err != nil {
 		return err
 	}
-	ep.tables.Store(fd, conn)
+	e.fdToConnTable.Store(conn.fd, conn)
+	ep.tables.Store(conn.id, conn)
+	conn.BindEpoller(e)
 	return nil
 }
-
 func (e *epoller) remove(c *connection) error {
 	subTcpNum()
 	fd := c.fd
@@ -165,10 +163,10 @@ func (e *epoller) remove(c *connection) error {
 	if err != nil {
 		return err
 	}
-	ep.tables.Delete(fd)
+	ep.tables.Delete(c.id)
+	e.fdToConnTable.Delete(c.fd)
 	return nil
 }
-
 func (e *epoller) wait(msec int) ([]*connection, error) {
 	events := make([]unix.EpollEvent, config.GetGatewayEpollWaitQueueSize())
 	n, err := unix.EpollWait(e.fd, events, msec)
@@ -177,13 +175,12 @@ func (e *epoller) wait(msec int) ([]*connection, error) {
 	}
 	var connections []*connection
 	for i := 0; i < n; i++ {
-		if conn, ok := ep.tables.Load(int(events[i].Fd)); ok {
+		if conn, ok := e.fdToConnTable.Load(int(events[i].Fd)); ok {
 			connections = append(connections, conn.(*connection))
 		}
 	}
 	return connections, nil
 }
-
 func socketFD(conn *net.TCPConn) int {
 	tcpConn := reflect.Indirect(reflect.ValueOf(*conn)).FieldByName("conn")
 	fdVal := tcpConn.FieldByName("fd")
@@ -191,9 +188,9 @@ func socketFD(conn *net.TCPConn) int {
 	return int(pfdVal.FieldByName("Sysfd").Int())
 }
 
-// 设置go进程打开文件数的限制
+// 设置go 进程打开文件数的限制
 func setLimit() {
-	var rLimit syscall.RLimit
+	var rLimit syscall.Rlimit
 	if err := syscall.Getrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
 		panic(err)
 	}
@@ -201,7 +198,8 @@ func setLimit() {
 	if err := syscall.Setrlimit(syscall.RLIMIT_NOFILE, &rLimit); err != nil {
 		panic(err)
 	}
-	log.Printf("set cur limit: %d", rLImit.Cur)
+
+	log.Printf("set cur limit: %d", rLimit.Cur)
 }
 
 func addTcpNum() {
@@ -211,7 +209,6 @@ func addTcpNum() {
 func getTcpNum() int32 {
 	return atomic.LoadInt32(&tcpNum)
 }
-
 func subTcpNum() {
 	atomic.AddInt32(&tcpNum, -1)
 }
@@ -222,6 +219,6 @@ func checkTcp() bool {
 	return num <= maxTcpNum
 }
 
-func setTcpConfig(c *net.TCPConn) {
+func setTcpConifg(c *net.TCPConn) {
 	_ = c.SetKeepAlive(true)
 }
